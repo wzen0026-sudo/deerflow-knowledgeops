@@ -115,3 +115,56 @@ def verify_evidence_excerpt(
         "verified": matched,
         "reason": ("Evidence excerpt found in the page text." if matched else "Evidence excerpt not found in the page text."),
     }
+
+
+def check_evidence_date_presence(
+    page_text: str,
+    evidence_date: str | date | None,
+) -> dict[str, str]:
+    """Check whether an evidence date appears in webpage text.
+
+    A date mention does not prove it is the publication date.
+    """
+
+    if evidence_date is None or evidence_date == "":
+        return {
+            "status": "MISSING",
+            "reason": "No evidence date was provided.",
+        }
+
+    try:
+        parsed_date = evidence_date if isinstance(evidence_date, date) else date.fromisoformat(evidence_date)
+    except (ValueError, TypeError):
+        return {
+            "status": "INVALID_DATE",
+            "reason": "Evidence date must use YYYY-MM-DD.",
+        }
+
+    # Support common date formats in English webpages.
+    candidates = [
+        parsed_date.isoformat(),
+        f"{parsed_date.strftime('%B')} {parsed_date.day}, {parsed_date.year}",
+        f"{parsed_date.strftime('%b')} {parsed_date.day}, {parsed_date.year}",
+        f"{parsed_date.day} {parsed_date.strftime('%B')} {parsed_date.year}",
+        f"{parsed_date.day} {parsed_date.strftime('%b')} {parsed_date.year}",
+    ]
+
+    normalized_text = " ".join(page_text.split()).casefold()
+
+    for candidate in candidates:
+        pattern = (
+            rf"(?<![a-z0-9])"
+            rf"{re.escape(candidate.casefold())}"
+            rf"(?![a-z0-9])"
+        )
+
+        if re.search(pattern, normalized_text):
+            return {
+                "status": "DATE_MENTIONED",
+                "reason": "The date appears in the webpage text.",
+            }
+
+    return {
+        "status": "DATE_NOT_FOUND",
+        "reason": "The date was not found in the webpage text.",
+    }

@@ -7,10 +7,11 @@ from typing import Any
 def build_audit_report(
     investigation_result: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build a traceable audit report from KnowledgeOps results."""
+    """Build an audit report preserving scored and review evidence."""
 
     assessment = investigation_result.get("assessment") or {}
     sources = assessment.get("sources_used") or []
+    failures = investigation_result.get("failures") or []
 
     audited_sources = []
 
@@ -25,10 +26,7 @@ def build_audit_report(
                 "stance": source.get("stance"),
                 "excerpt": source.get("excerpt"),
                 "evidence_date": source.get("evidence_date"),
-                "date_verification_status": source.get(
-                    "date_verification_status",
-                    "NOT_VERIFIED",
-                ),
+                "date_verification_status": source.get("date_verification_status", "NOT_VERIFIED"),
                 "source_type": source.get("source_type"),
                 "is_primary_source": source.get("is_primary_source"),
                 "directness": source.get("directness"),
@@ -37,21 +35,46 @@ def build_audit_report(
             }
         )
 
+    # Keep extracted evidence that could not be scored.
+    review_items = []
+
+    for failure in failures:
+        if not isinstance(failure, dict):
+            continue
+
+        evidence = failure.get("evidence")
+
+        if not isinstance(evidence, dict) or not evidence:
+            continue
+
+        review_items.append(
+            {
+                "source_url": failure.get("source_url"),
+                "status": failure.get("status"),
+                "stage": failure.get("stage"),
+                "reason": failure.get("reason"),
+                "evidence": evidence,
+                "date_verification_status": evidence.get("date_verification_status", "NOT_VERIFIED"),
+            }
+        )
+
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "generated_at_utc": datetime.now(UTC).isoformat(),
         "claim": investigation_result.get("claim"),
         "investigation_status": investigation_result.get("status"),
         "assessment_status": assessment.get("status"),
         "assessment_report": assessment.get("report"),
+        "assessment_reason": assessment.get("reason"),
         "sources_requested": investigation_result.get("sources_requested"),
         "sources_scored": investigation_result.get("sources_scored"),
         "duplicates_skipped": assessment.get("duplicates_skipped", 0),
-        "failures": investigation_result.get("failures", []),
         "evidence": audited_sources,
+        "review_items": review_items,
+        "failures": failures,
         "limitations": [
             "Confidence scores are heuristic, not probabilities.",
-            "Evidence dates are not independently verified.",
+            "Evidence dates require independent verification.",
             "Different publishers may share original evidence.",
             "Evidence stance and relevance require further review.",
         ],

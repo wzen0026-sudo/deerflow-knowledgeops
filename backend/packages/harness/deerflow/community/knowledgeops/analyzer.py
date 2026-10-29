@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from deerflow.community.knowledgeops.evidence import (
     EvidenceRecord,
+    check_evidence_date_presence,
     verify_evidence_excerpt,
 )
 from deerflow.community.knowledgeops.tools import (
@@ -29,9 +30,9 @@ def validate_extracted_evidence(
     fetched_url: str,
     extracted: dict,
 ) -> dict:
-    """Validate evidence extracted from a fetched webpage."""
+    """Validate extracted evidence and check date presence."""
 
-    # 1. Validate the evidence record structure.
+    # Step 1: Validate evidence structure.
     try:
         record = EvidenceRecord.model_validate(extracted)
     except ValidationError as exc:
@@ -52,21 +53,21 @@ def validate_extracted_evidence(
             "reason": "Invalid evidence record: " + "; ".join(details),
         }
 
-    # 2. Ensure evidence belongs to the fetched webpage.
+    # Step 2: Verify source URL.
     if str(record.source_url).rstrip("/") != fetched_url.rstrip("/"):
         return {
             "status": "REJECTED",
             "reason": "Source URL does not match the fetched URL.",
         }
 
-    # 3. Reject future evidence dates.
+    # Step 3: Reject future dates.
     if record.evidence_date and record.evidence_date > date.today():
         return {
             "status": "REJECTED",
             "reason": "Evidence date cannot be in the future.",
         }
 
-    # 4. Verify the quoted text against the webpage.
+    # Step 4: Verify the quotation.
     verification = verify_evidence_excerpt(
         page_text,
         record.excerpt,
@@ -78,11 +79,24 @@ def validate_extracted_evidence(
             "reason": verification["reason"],
         }
 
-    # 5. Return validated evidence.
+    # Step 5: Check whether the date occurs in the webpage.
+    date_check = check_evidence_date_presence(
+        page_text,
+        record.evidence_date,
+    )
+
+    evidence = record.model_dump(mode="json")
+
+    evidence["date_presence_status"] = date_check["status"]
+    evidence["date_presence_reason"] = date_check["reason"]
+
+    # A mentioned date is not necessarily a publication date.
+    evidence["date_verification_status"] = "NOT_VERIFIED"
+
     return {
         "status": "ACCEPTED",
-        "evidence": record.model_dump(mode="json"),
-        "note": ("Quotation verified. Evidence stance and factual correctness require separate analysis."),
+        "evidence": evidence,
+        "note": ("Quotation verified. Date presence checked. Date provenance and factual correctness are not verified."),
     }
 
 
@@ -288,8 +302,9 @@ async def score_accepted_evidence(
     analysis_result: dict,
     knowledge_type: str = "general",
 ) -> dict:
-    """Score validated evidence and return structured results."""
+    """Score evidence only when its date has verified provenance."""
 
+    # Step 1: Only accepted evidence can be scored.
     if analysis_result.get("status") != "ACCEPTED":
         return {
             "status": "SKIPPED",
@@ -298,12 +313,29 @@ async def score_accepted_evidence(
 
     evidence = analysis_result["evidence"]
 
+    # Step 2: Require an evidence date.
     if not evidence.get("evidence_date"):
         return {
             "status": "NEEDS_REVIEW",
             "reason": "Evidence date is missing.",
+            "evidence": evidence,
         }
 
+    # Step 3: Do not trust dates extracted by the LLM alone.
+    date_status = evidence.get(
+        "date_verification_status",
+        "NOT_VERIFIED",
+    )
+
+    if date_status != "VERIFIED":
+        return {
+            "status": "NEEDS_REVIEW",
+            "reason": ("Evidence date has not been independently verified. Freshness scoring is withheld."),
+            "date_verification_status": date_status,
+            "evidence": evidence,
+        }
+
+    # Step 4: Calculate reliability only with a verified date.
     try:
         details = calculate_evidence_reliability_details(
             source_type=evidence["source_type"],
@@ -316,6 +348,7 @@ async def score_accepted_evidence(
         return {
             "status": "NEEDS_REVIEW",
             "reason": "Evidence scoring inputs are invalid.",
+            "evidence": evidence,
         }
 
     return {
@@ -521,7 +554,7 @@ async def analyze_claim_sources(
     source_urls: list[str],
     knowledge_type: str = "general",
 ) -> dict:
-    """Analyze multiple webpages and produce a claim assessment."""
+    """Analyze sources while preserving evidence requiring review."""
 
     if not claim.strip():
         return {
@@ -529,7 +562,6 @@ async def analyze_claim_sources(
             "reason": "Claim cannot be empty.",
         }
 
-    # Limit the number of pages to control cost.
     if not 2 <= len(source_urls) <= 5:
         return {
             "status": "INVALID",
@@ -545,7 +577,6 @@ async def analyze_claim_sources(
     scored_results = []
     failures = []
 
-    # Analyze each source using our existing pipeline.
     for url in source_urls:
         result = await analyze_claim_source(
             claim=claim,
@@ -556,15 +587,20 @@ async def analyze_claim_sources(
         if result.get("status") == "SCORED":
             scored_results.append(result)
         else:
+            # Preserve evidence even when scoring is withheld.
             failures.append(
                 {
                     "source_url": url,
                     "status": result.get("status", "ERROR"),
-                    "reason": result.get("reason", "Analysis failed."),
+                    "stage": result.get("stage"),
+                    "reason": result.get(
+                        "reason",
+                        "Analysis failed.",
+                    ),
+                    "evidence": result.get("evidence"),
                 }
             )
 
-    # Aggregate evidence and calculate final confidence.
     assessment = await assess_scored_evidence(
         claim,
         scored_results,
