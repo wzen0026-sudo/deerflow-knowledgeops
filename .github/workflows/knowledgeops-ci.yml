@@ -1,0 +1,59 @@
+
+name: KnowledgeOps CI
+
+on:
+  push:
+    branches:
+      - knowledgeops-dev
+    paths:
+      - "backend/packages/harness/deerflow/community/knowledgeops/**"
+      - "backend/tests/test_knowledgeops_*.py"
+      - ".github/workflows/knowledgeops-ci.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: knowledgeops-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  knowledgeops-tests:
+    name: KnowledgeOps Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.1"
+
+      - name: Install dependencies
+        working-directory: backend
+        run: uv sync --group dev
+
+      - name: Ruff lint
+        working-directory: backend
+        run: |
+          uv run ruff check packages/harness/deerflow/community/knowledgeops tests/test_knowledgeops_lifecycle.py
+
+      - name: Ruff format
+        working-directory: backend
+        run: |
+          uv run ruff format --check packages/harness/deerflow/community/knowledgeops tests/test_knowledgeops_lifecycle.py
+
+      - name: Run KnowledgeOps tests
+        working-directory: backend
+        run: |
+          uv run pytest -q tests/test_knowledgeops_lifecycle.py
