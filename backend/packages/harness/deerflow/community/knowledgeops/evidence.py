@@ -44,6 +44,27 @@ class EvidenceRecord(BaseModel):
             raise ValueError("Text must not be empty.")
         return value.strip()
 
+    @field_validator("evidence_date", mode="before")
+    @classmethod
+    def normalize_evidence_date(cls, value):
+        """Normalize common missing-date values to None."""
+
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+
+            if normalized in {
+                "",
+                "unknown",
+                "n/a",
+                "none",
+                "null",
+                "not specified",
+                "not available",
+            }:
+                return None
+
+        return value
+
 
 def verify_evidence_excerpt(
     page_text: str,

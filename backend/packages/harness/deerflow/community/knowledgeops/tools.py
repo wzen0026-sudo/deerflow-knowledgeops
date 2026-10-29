@@ -417,3 +417,60 @@ knowledge_claim_confidence_tool = StructuredTool.from_function(
     name="knowledge_claim_confidence",
     description=("Calculate the final confidence of a claim using reliability scores from evidence that supports or contradicts the claim. Returns a 0-100 confidence score and a clear verdict."),
 )
+
+
+def calculate_evidence_reliability_details(
+    *,
+    source_type: str,
+    evidence_date: str,
+    knowledge_type: str,
+    is_primary_source: bool,
+    directness: str,
+) -> dict[str, int]:
+    """Calculate structured evidence reliability scores."""
+
+    parsed_date = _parse_date(evidence_date)
+
+    if parsed_date is None:
+        raise ValueError("Invalid evidence date.")
+
+    age_days = (date.today() - parsed_date).days
+
+    if age_days < 0:
+        raise ValueError("Evidence date cannot be in the future.")
+
+    source_type = source_type.strip().lower()
+    knowledge_type = knowledge_type.strip().lower()
+    directness = directness.strip().lower()
+
+    if directness not in EVIDENCE_DIRECTNESS_SCORES:
+        raise ValueError("Invalid evidence directness.")
+
+    max_age_days = FRESHNESS_POLICIES.get(
+        knowledge_type,
+        FRESHNESS_POLICIES["general"],
+    )
+
+    authority_score = EVIDENCE_AUTHORITY_SCORES.get(
+        source_type,
+        EVIDENCE_AUTHORITY_SCORES["unknown"],
+    )
+
+    freshness_score = _calculate_evidence_freshness_score(
+        age_days,
+        max_age_days,
+    )
+
+    primary_score = 20 if is_primary_source else 8
+    directness_score = EVIDENCE_DIRECTNESS_SCORES[directness]
+
+    total_score = authority_score + freshness_score + primary_score + directness_score
+
+    return {
+        "reliability_score": total_score,
+        "authority_score": authority_score,
+        "freshness_score": freshness_score,
+        "primary_score": primary_score,
+        "directness_score": directness_score,
+        "age_days": age_days,
+    }
