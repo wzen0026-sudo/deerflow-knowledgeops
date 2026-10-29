@@ -1,5 +1,5 @@
 import re
-from datetime import date
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, HttpUrl, field_validator
@@ -167,4 +167,82 @@ def check_evidence_date_presence(
     return {
         "status": "DATE_NOT_FOUND",
         "reason": "The date was not found in the webpage text.",
+    }
+
+
+def check_publication_date_metadata(
+    metadata: dict | None,
+    evidence_date: str | date | None,
+) -> dict:
+    """Compare an evidence date against explicit publication metadata."""
+
+    if evidence_date is None or evidence_date == "":
+        return {
+            "status": "MISSING_DATE",
+            "reason": "No evidence date was supplied.",
+        }
+
+    try:
+        expected_date = evidence_date if isinstance(evidence_date, date) else date.fromisoformat(evidence_date)
+    except (ValueError, TypeError):
+        return {
+            "status": "INVALID_DATE",
+            "reason": "Invalid evidence date.",
+        }
+
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    publication_fields = {
+        "article:published_time",
+        "datepublished",
+        "date_published",
+        "published_time",
+        "pubdate",
+    }
+
+    dates_found = set()
+
+    for key, value in metadata.items():
+        if not isinstance(key, str):
+            continue
+
+        if key.casefold() not in publication_fields:
+            continue
+
+        if not isinstance(value, str):
+            continue
+
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00")).date()
+        except ValueError:
+            continue
+
+        dates_found.add(parsed)
+
+    if not dates_found:
+        return {
+            "status": "NO_PUBLICATION_METADATA",
+            "reason": "No usable publication date metadata found.",
+        }
+
+    if len(dates_found) > 1:
+        return {
+            "status": "METADATA_CONFLICT",
+            "reason": "Publication metadata contains conflicting dates.",
+        }
+
+    actual_date = next(iter(dates_found))
+
+    if expected_date == actual_date:
+        return {
+            "status": "METADATA_MATCH",
+            "metadata_date": actual_date.isoformat(),
+            "reason": "Evidence date matches publication metadata.",
+        }
+
+    return {
+        "status": "METADATA_MISMATCH",
+        "metadata_date": actual_date.isoformat(),
+        "reason": "Evidence date differs from publication metadata.",
     }

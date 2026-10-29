@@ -27,6 +27,11 @@ def build_audit_report(
                 "excerpt": source.get("excerpt"),
                 "evidence_date": source.get("evidence_date"),
                 "date_verification_status": source.get("date_verification_status", "NOT_VERIFIED"),
+                "date_presence_status": source.get("date_presence_status", "NOT_CHECKED"),
+                "publication_metadata_check": source.get(
+                    "publication_metadata_check",
+                    {"status": "NOT_CHECKED"},
+                ),
                 "source_type": source.get("source_type"),
                 "is_primary_source": source.get("is_primary_source"),
                 "directness": source.get("directness"),

@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from deerflow.community.knowledgeops.evidence import (
     EvidenceRecord,
     check_evidence_date_presence,
+    check_publication_date_metadata,
     verify_evidence_excerpt,
 )
 from deerflow.community.knowledgeops.tools import (
@@ -187,7 +188,7 @@ async def extract_evidence_from_url(
     claim: str,
     source_url: str,
 ) -> dict:
-    """Fetch a permitted webpage and extract verified evidence."""
+    """Fetch a permitted webpage and extract auditable evidence."""
 
     if not claim.strip():
         return {
@@ -195,7 +196,7 @@ async def extract_evidence_from_url(
             "reason": "Claim cannot be empty.",
         }
 
-    # Step 1: Validate the requested URL.
+    # Validate the requested URL.
     safety_result = validate_allowed_source_url(source_url)
 
     if not safety_result["safe"]:
@@ -204,7 +205,6 @@ async def extract_evidence_from_url(
             "reason": safety_result["reason"],
         }
 
-    # Step 2: Load the Jina API key.
     load_dotenv(find_dotenv(usecwd=True))
     api_key = os.getenv("JINA_API_KEY")
 
@@ -214,7 +214,7 @@ async def extract_evidence_from_url(
             "reason": "JINA_API_KEY is not configured.",
         }
 
-    # Step 3: Request structured JSON from Jina Reader.
+    # Retrieve structured data from Jina Reader.
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
@@ -236,7 +236,6 @@ async def extract_evidence_from_url(
             "reason": f"Jina returned HTTP {response.status_code}.",
         }
 
-    # Step 4: Validate the returned JSON structure.
     try:
         payload = response.json()
     except ValueError:
@@ -262,7 +261,7 @@ async def extract_evidence_from_url(
     returned_url = data.get("url")
     page_text = data.get("content")
 
-    # Step 5: Validate the URL reported by Jina.
+    # Check the URL reported by Jina.
     if not isinstance(returned_url, str):
         return {
             "status": "SOURCE_MISMATCH",
@@ -283,19 +282,36 @@ async def extract_evidence_from_url(
             "reason": "Jina reported a different source URL.",
         }
 
-    # Step 6: Check webpage content.
     if not isinstance(page_text, str) or not page_text.strip():
         return {
             "status": "FETCH_FAILED",
             "reason": "Fetched webpage content is empty.",
         }
 
-    # Step 7: Reuse GPT-5 mini extraction and evidence validation.
-    return await extract_evidence_from_text(
+    # Extract evidence and verify its quotation.
+    result = await extract_evidence_from_text(
         claim=claim,
         page_text=page_text,
         fetched_url=source_url,
     )
+
+    if result.get("status") != "ACCEPTED":
+        return result
+
+    # Compare the extracted date with webpage publication metadata.
+    evidence = result["evidence"]
+
+    metadata_check = check_publication_date_metadata(
+        data.get("metadata"),
+        evidence.get("evidence_date"),
+    )
+
+    evidence["publication_metadata_check"] = metadata_check
+
+    # A metadata match is not independent verification.
+    evidence["date_verification_status"] = "NOT_VERIFIED"
+
+    return result
 
 
 async def score_accepted_evidence(
@@ -448,7 +464,12 @@ def aggregate_scored_evidence(results: list[dict]) -> dict:
             "is_primary_source": evidence.get("is_primary_source"),
             "directness": evidence.get("directness"),
             "reliability_details": details,
-            "date_verification_status": "NOT_VERIFIED",
+            "date_presence_status": evidence.get("date_presence_status", "NOT_CHECKED"),
+            "publication_metadata_check": evidence.get(
+                "publication_metadata_check",
+                {"status": "NOT_CHECKED"},
+            ),
+            "date_verification_status": evidence.get("date_verification_status", "NOT_VERIFIED"),
         }
 
         # Detect conflicts from the same publisher.
