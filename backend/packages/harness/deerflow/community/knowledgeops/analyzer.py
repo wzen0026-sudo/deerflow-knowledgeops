@@ -1,7 +1,7 @@
+import asyncio
 import json
 import os
 from datetime import date
-from urllib.parse import urlsplit
 
 import httpx
 from dotenv import find_dotenv, load_dotenv
@@ -15,6 +15,11 @@ from deerflow.community.knowledgeops.tools import (
     calculate_evidence_reliability_details,
     knowledge_claim_confidence,
 )
+from deerflow.community.knowledgeops.url_safety import (
+    get_source_publisher,
+    validate_allowed_source_url,
+)
+from deerflow.community.tavily.tools import web_search_tool
 from deerflow.config import get_app_config
 from deerflow.utils.oneshot_llm import run_oneshot_llm
 
@@ -168,14 +173,13 @@ async def extract_evidence_from_url(
             "status": "REJECTED",
             "reason": "Claim cannot be empty.",
         }
+    # Validate both URL safety and the source allowlist.
+    safety_result = validate_allowed_source_url(source_url)
 
-    parsed = urlsplit(source_url)
-
-    # Temporary allowlist for safe initial testing.
-    if parsed.scheme != "https" or parsed.hostname not in {"python.org", "www.python.org"} or parsed.username is not None or parsed.password is not None:
+    if not safety_result["safe"]:
         return {
             "status": "REJECTED",
-            "reason": "Only HTTPS URLs from python.org are allowed in this prototype.",
+            "reason": safety_result["reason"],
         }
 
     # Load the existing Jina API key.
@@ -313,9 +317,9 @@ async def analyze_claim_source(
 
 
 def aggregate_scored_evidence(results: list[dict]) -> dict:
-    """Aggregate scored evidence from multiple source URLs."""
+    """Aggregate scored evidence by publisher, not hostname."""
 
-    sources = {}
+    publishers = {}
     duplicates_skipped = 0
 
     for result in results:
@@ -335,51 +339,55 @@ def aggregate_scored_evidence(results: list[dict]) -> dict:
                 "reason": "Invalid scored evidence data.",
             }
 
-        try:
-            parsed = urlsplit(source_url)
-            if parsed.scheme != "https" or not parsed.hostname:
-                raise ValueError("Invalid source URL.")
-            hostname = parsed.hostname.lower().removeprefix("www.")
-        except ValueError:
+        # Identify the publisher using our unified source policy.
+        publisher = get_source_publisher(source_url)
+
+        if publisher is None:
             return {
                 "status": "INVALID",
-                "reason": "Invalid source URL.",
+                "reason": "Source URL is not permitted.",
             }
 
         record = {
             "source_url": source_url,
+            "publisher": publisher,
             "stance": stance,
             "reliability_score": score,
         }
 
-        # Count a hostname only once.
-        if hostname in sources:
-            previous = sources[hostname]
+        # Each publisher contributes at most one evidence score.
+        if publisher in publishers:
+            previous = publishers[publisher]
             previous_stance = previous["stance"]
 
+            # Different non-neutral stances from the same publisher
+            # require review rather than arbitrary selection.
             if stance != previous_stance and stance != "NEUTRAL" and previous_stance != "NEUTRAL":
                 return {
                     "status": "NEEDS_REVIEW",
-                    "reason": "Conflicting evidence from the same hostname.",
+                    "reason": ("Conflicting evidence from the same publisher."),
+                    "publisher": publisher,
                 }
 
             duplicates_skipped += 1
 
             if (previous_stance == "NEUTRAL" and stance != "NEUTRAL") or (stance == previous_stance and score > previous["reliability_score"]):
-                sources[hostname] = record
+                publishers[publisher] = record
 
             continue
 
-        sources[hostname] = record
+        publishers[publisher] = record
 
-    unique_evidence = list(sources.values())
+    unique_evidence = list(publishers.values())
 
     relevant_evidence = [item for item in unique_evidence if item["stance"] != "NEUTRAL"]
 
+    # Require two distinct publishers with relevant evidence.
     if len(relevant_evidence) < 2:
         return {
             "status": "INSUFFICIENT_EVIDENCE",
-            "reason": "At least two distinct relevant source hosts are required.",
+            "reason": ("At least two distinct publishers with relevant evidence are required."),
+            "unique_publishers": len(publishers),
             "duplicates_skipped": duplicates_skipped,
         }
 
@@ -392,7 +400,7 @@ def aggregate_scored_evidence(results: list[dict]) -> dict:
         "support_scores": support_scores,
         "contradict_scores": contradict_scores,
         "sources_used": relevant_evidence,
-        "unique_hosts": len(sources),
+        "unique_publishers": len(publishers),
         "duplicates_skipped": duplicates_skipped,
     }
 
@@ -505,3 +513,140 @@ async def analyze_claim_sources(
         "failures": failures,
         "assessment": assessment,
     }
+
+
+async def discover_source_urls(
+    claim: str,
+    max_sources: int = 3,
+) -> dict:
+    """Find candidate evidence URLs using DeerFlow's Tavily search."""
+
+    claim = claim.strip()
+
+    if not claim:
+        return {
+            "status": "INVALID",
+            "reason": "Claim cannot be empty.",
+        }
+
+    if not 1 <= max_sources <= 5:
+        return {
+            "status": "INVALID",
+            "reason": "max_sources must be between 1 and 5.",
+        }
+
+    # Step 1: Search with DeerFlow's existing Tavily tool.
+    try:
+        raw_result = await asyncio.to_thread(
+            web_search_tool.invoke,
+            {"query": claim},
+        )
+        search_results = json.loads(raw_result)
+    except Exception:
+        return {
+            "status": "SEARCH_FAILED",
+            "reason": "Unable to retrieve or parse search results.",
+        }
+
+    if not isinstance(search_results, list):
+        return {
+            "status": "SEARCH_FAILED",
+            "reason": "Unexpected search result format.",
+        }
+
+    # Step 2: Validate and select candidate source URLs.
+    selected_sources = []
+    seen_urls = set()
+
+    for item in search_results:
+        if not isinstance(item, dict):
+            continue
+
+        url = item.get("url")
+
+        if not isinstance(url, str):
+            continue
+
+        # Check URL safety and the unified source allowlist.
+        safety_result = validate_allowed_source_url(url)
+
+        if not safety_result["safe"]:
+            continue
+
+        # Skip duplicate URLs.
+        if url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+
+        selected_sources.append(
+            {
+                "title": item.get("title", ""),
+                "url": url,
+            }
+        )
+
+        if len(selected_sources) >= max_sources:
+            break
+
+    # Step 3: Return candidate sources.
+    return {
+        "status": "FOUND" if selected_sources else "NO_SOURCES",
+        "claim": claim,
+        "total_search_results": len(search_results),
+        "selected_sources": selected_sources,
+    }
+
+
+async def investigate_claim(
+    claim: str,
+    knowledge_type: str = "general",
+    max_sources: int = 3,
+) -> dict:
+    """Discover sources and assess a claim using distinct publishers."""
+
+    # Step 1: Search for candidate evidence sources.
+    discovery = await discover_source_urls(
+        claim=claim,
+        max_sources=max_sources,
+    )
+
+    if discovery.get("status") != "FOUND":
+        return discovery
+
+    source_urls = [source["url"] for source in discovery["selected_sources"]]
+
+    # Step 2: Group URLs by publisher.
+    # Multiple pages from the same publisher count only once.
+    publisher_sources = {}
+
+    for url in source_urls:
+        publisher = get_source_publisher(url)
+
+        if publisher is None:
+            continue
+
+        if publisher not in publisher_sources:
+            publisher_sources[publisher] = url
+
+    unique_publishers = len(publisher_sources)
+
+    # Step 3: Require at least two distinct publishers.
+    if unique_publishers < 2:
+        return {
+            "status": "INSUFFICIENT_SOURCES",
+            "reason": ("Fewer than two distinct publishers were found. Independent evidence is insufficient."),
+            "candidate_urls": source_urls,
+            "unique_publishers": unique_publishers,
+            "publishers_found": list(publisher_sources.keys()),
+        }
+
+    # Step 4: Select one URL per publisher.
+    selected_urls = list(publisher_sources.values())
+
+    # Step 5: Reuse the existing multi-source analysis pipeline.
+    return await analyze_claim_sources(
+        claim=claim,
+        source_urls=selected_urls,
+        knowledge_type=knowledge_type,
+    )
