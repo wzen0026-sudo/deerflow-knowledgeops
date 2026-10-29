@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from deerflow.community.knowledgeops.evidence import (
     EvidenceRecord,
+    assess_date_provenance,
     check_evidence_date_presence,
     check_publication_date_metadata,
     verify_evidence_excerpt,
@@ -196,7 +197,7 @@ async def extract_evidence_from_url(
             "reason": "Claim cannot be empty.",
         }
 
-    # Validate the requested URL.
+    # Step 1: Validate the requested URL.
     safety_result = validate_allowed_source_url(source_url)
 
     if not safety_result["safe"]:
@@ -205,6 +206,7 @@ async def extract_evidence_from_url(
             "reason": safety_result["reason"],
         }
 
+    # Step 2: Load the Jina API key.
     load_dotenv(find_dotenv(usecwd=True))
     api_key = os.getenv("JINA_API_KEY")
 
@@ -214,7 +216,7 @@ async def extract_evidence_from_url(
             "reason": "JINA_API_KEY is not configured.",
         }
 
-    # Retrieve structured data from Jina Reader.
+    # Step 3: Retrieve structured data from Jina Reader.
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
@@ -236,6 +238,7 @@ async def extract_evidence_from_url(
             "reason": f"Jina returned HTTP {response.status_code}.",
         }
 
+    # Step 4: Parse the Jina JSON response.
     try:
         payload = response.json()
     except ValueError:
@@ -261,7 +264,7 @@ async def extract_evidence_from_url(
     returned_url = data.get("url")
     page_text = data.get("content")
 
-    # Check the URL reported by Jina.
+    # Step 5: Validate the URL reported by Jina.
     if not isinstance(returned_url, str):
         return {
             "status": "SOURCE_MISMATCH",
@@ -282,13 +285,14 @@ async def extract_evidence_from_url(
             "reason": "Jina reported a different source URL.",
         }
 
+    # Step 6: Validate the fetched page content.
     if not isinstance(page_text, str) or not page_text.strip():
         return {
             "status": "FETCH_FAILED",
             "reason": "Fetched webpage content is empty.",
         }
 
-    # Extract evidence and verify its quotation.
+    # Step 7: Extract evidence and verify the quotation.
     result = await extract_evidence_from_text(
         claim=claim,
         page_text=page_text,
@@ -298,9 +302,10 @@ async def extract_evidence_from_url(
     if result.get("status") != "ACCEPTED":
         return result
 
-    # Compare the extracted date with webpage publication metadata.
+    # Step 8: Obtain the extracted evidence.
     evidence = result["evidence"]
 
+    # Step 9: Compare its date with publication metadata.
     metadata_check = check_publication_date_metadata(
         data.get("metadata"),
         evidence.get("evidence_date"),
@@ -308,7 +313,19 @@ async def extract_evidence_from_url(
 
     evidence["publication_metadata_check"] = metadata_check
 
-    # A metadata match is not independent verification.
+    # Step 10: Assess the provenance of the evidence date.
+    date_provenance = assess_date_provenance(
+        evidence_date=evidence.get("evidence_date"),
+        date_presence_status=evidence.get(
+            "date_presence_status",
+            "NOT_CHECKED",
+        ),
+        publication_metadata_check=metadata_check,
+    )
+
+    evidence["date_provenance"] = date_provenance
+
+    # Source attestation is not independent verification.
     evidence["date_verification_status"] = "NOT_VERIFIED"
 
     return result
@@ -453,6 +470,7 @@ def aggregate_scored_evidence(results: list[dict]) -> dict:
                 "reason": "Source URL is not permitted.",
             }
 
+        # Preserve evidence details for auditing.
         record = {
             "source_url": source_url,
             "publisher": publisher,
@@ -464,12 +482,22 @@ def aggregate_scored_evidence(results: list[dict]) -> dict:
             "is_primary_source": evidence.get("is_primary_source"),
             "directness": evidence.get("directness"),
             "reliability_details": details,
-            "date_presence_status": evidence.get("date_presence_status", "NOT_CHECKED"),
+            "date_presence_status": evidence.get(
+                "date_presence_status",
+                "NOT_CHECKED",
+            ),
             "publication_metadata_check": evidence.get(
                 "publication_metadata_check",
                 {"status": "NOT_CHECKED"},
             ),
-            "date_verification_status": evidence.get("date_verification_status", "NOT_VERIFIED"),
+            "date_verification_status": evidence.get(
+                "date_verification_status",
+                "NOT_VERIFIED",
+            ),
+            "date_provenance": evidence.get(
+                "date_provenance",
+                {"status": "NOT_CHECKED"},
+            ),
         }
 
         # Detect conflicts from the same publisher.
@@ -499,7 +527,7 @@ def aggregate_scored_evidence(results: list[dict]) -> dict:
 
     relevant_evidence = [item for item in unique_evidence if item["stance"] != "NEUTRAL"]
 
-    # Important: retain all evidence even when assessment fails.
+    # Retain all evidence even when assessment cannot proceed.
     if len(relevant_evidence) < 2:
         return {
             "status": "INSUFFICIENT_EVIDENCE",

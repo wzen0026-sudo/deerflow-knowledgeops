@@ -15,6 +15,7 @@ def build_audit_report(
 
     audited_sources = []
 
+    # Preserve successfully scored evidence.
     for source in sources:
         if not isinstance(source, dict):
             continue
@@ -26,21 +27,34 @@ def build_audit_report(
                 "stance": source.get("stance"),
                 "excerpt": source.get("excerpt"),
                 "evidence_date": source.get("evidence_date"),
-                "date_verification_status": source.get("date_verification_status", "NOT_VERIFIED"),
-                "date_presence_status": source.get("date_presence_status", "NOT_CHECKED"),
+                "date_verification_status": source.get(
+                    "date_verification_status",
+                    "NOT_VERIFIED",
+                ),
+                "date_presence_status": source.get(
+                    "date_presence_status",
+                    "NOT_CHECKED",
+                ),
                 "publication_metadata_check": source.get(
                     "publication_metadata_check",
+                    {"status": "NOT_CHECKED"},
+                ),
+                "date_provenance": source.get(
+                    "date_provenance",
                     {"status": "NOT_CHECKED"},
                 ),
                 "source_type": source.get("source_type"),
                 "is_primary_source": source.get("is_primary_source"),
                 "directness": source.get("directness"),
                 "reliability_score": source.get("reliability_score"),
-                "reliability_details": source.get("reliability_details", {}),
+                "reliability_details": source.get(
+                    "reliability_details",
+                    {},
+                ),
             }
         )
 
-    # Keep extracted evidence that could not be scored.
+    # Preserve extracted evidence that could not be scored.
     review_items = []
 
     for failure in failures:
@@ -59,7 +73,22 @@ def build_audit_report(
                 "stage": failure.get("stage"),
                 "reason": failure.get("reason"),
                 "evidence": evidence,
-                "date_verification_status": evidence.get("date_verification_status", "NOT_VERIFIED"),
+                "date_verification_status": evidence.get(
+                    "date_verification_status",
+                    "NOT_VERIFIED",
+                ),
+                "date_presence_status": evidence.get(
+                    "date_presence_status",
+                    "NOT_CHECKED",
+                ),
+                "publication_metadata_check": evidence.get(
+                    "publication_metadata_check",
+                    {"status": "NOT_CHECKED"},
+                ),
+                "date_provenance": evidence.get(
+                    "date_provenance",
+                    {"status": "NOT_CHECKED"},
+                ),
             }
         )
 
@@ -73,7 +102,10 @@ def build_audit_report(
         "assessment_reason": assessment.get("reason"),
         "sources_requested": investigation_result.get("sources_requested"),
         "sources_scored": investigation_result.get("sources_scored"),
-        "duplicates_skipped": assessment.get("duplicates_skipped", 0),
+        "duplicates_skipped": assessment.get(
+            "duplicates_skipped",
+            0,
+        ),
         "evidence": audited_sources,
         "review_items": review_items,
         "failures": failures,

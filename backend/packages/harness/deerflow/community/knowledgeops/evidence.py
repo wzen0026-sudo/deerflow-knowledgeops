@@ -246,3 +246,74 @@ def check_publication_date_metadata(
         "metadata_date": actual_date.isoformat(),
         "reason": "Evidence date differs from publication metadata.",
     }
+
+
+def assess_date_provenance(
+    evidence_date: str | date | None,
+    date_presence_status: str,
+    publication_metadata_check: dict | None,
+) -> dict:
+    """Assess date provenance without claiming independent verification."""
+
+    base = {
+        "independently_verified": False,
+        "provisional_freshness_allowed": False,
+    }
+
+    if evidence_date is None:
+        return {
+            **base,
+            "status": "NEEDS_REVIEW",
+            "reason": "Evidence date is missing.",
+        }
+
+    try:
+        parsed_date = evidence_date if isinstance(evidence_date, date) else date.fromisoformat(evidence_date)
+    except (TypeError, ValueError):
+        return {
+            **base,
+            "status": "NEEDS_REVIEW",
+            "reason": "Evidence date is invalid.",
+        }
+
+    if parsed_date > date.today():
+        return {
+            **base,
+            "status": "NEEDS_REVIEW",
+            "reason": "Evidence date is in the future.",
+        }
+
+    metadata = publication_metadata_check or {}
+    metadata_status = metadata.get("status")
+
+    if metadata_status in {
+        "METADATA_MISMATCH",
+        "METADATA_CONFLICT",
+    }:
+        return {
+            **base,
+            "status": "DATE_CONFLICT",
+            "reason": "Publication metadata is inconsistent.",
+        }
+
+    if metadata_status == "METADATA_MATCH":
+        if metadata.get("metadata_date") != parsed_date.isoformat():
+            return {
+                **base,
+                "status": "DATE_CONFLICT",
+                "reason": "Reported metadata date is inconsistent.",
+            }
+
+        return {
+            **base,
+            "status": "SOURCE_ATTESTED",
+            "provisional_freshness_allowed": True,
+            "body_date_mentioned": (date_presence_status == "DATE_MENTIONED"),
+            "reason": ("Publication date matches source-provided metadata. Independent verification is not established."),
+        }
+
+    return {
+        **base,
+        "status": "NEEDS_REVIEW",
+        "reason": "No matching publication metadata is available.",
+    }
