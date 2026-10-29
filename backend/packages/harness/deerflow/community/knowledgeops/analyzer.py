@@ -35,12 +35,23 @@ def validate_extracted_evidence(
     try:
         record = EvidenceRecord.model_validate(extracted)
     except ValidationError as exc:
-        details = "; ".join(f"{'.'.join(map(str, error['loc']))}: {error['type']}" for error in exc.errors(include_input=False))
+        details = []
+
+        for error in exc.errors(include_input=True):
+            field = ".".join(map(str, error["loc"]))
+            error_type = error["type"]
+
+            if field == "evidence_date":
+                invalid_value = repr(error.get("input"))
+                details.append(f"{field}: {error_type}; received={invalid_value[:100]}")
+            else:
+                details.append(f"{field}: {error_type}")
 
         return {
             "status": "REJECTED",
-            "reason": f"Invalid evidence record: {details}",
+            "reason": "Invalid evidence record: " + "; ".join(details),
         }
+
     # 2. Ensure evidence belongs to the fetched webpage.
     if str(record.source_url).rstrip("/") != fetched_url.rstrip("/"):
         return {
@@ -162,18 +173,15 @@ async def extract_evidence_from_url(
     claim: str,
     source_url: str,
 ) -> dict:
-    """
-    Fetch a real webpage and extract verified evidence.
-
-    For the first prototype, only python.org is allowed.
-    """
+    """Fetch a permitted webpage and extract verified evidence."""
 
     if not claim.strip():
         return {
             "status": "REJECTED",
             "reason": "Claim cannot be empty.",
         }
-    # Validate both URL safety and the source allowlist.
+
+    # Step 1: Validate the requested URL.
     safety_result = validate_allowed_source_url(source_url)
 
     if not safety_result["safe"]:
@@ -182,7 +190,7 @@ async def extract_evidence_from_url(
             "reason": safety_result["reason"],
         }
 
-    # Load the existing Jina API key.
+    # Step 2: Load the Jina API key.
     load_dotenv(find_dotenv(usecwd=True))
     api_key = os.getenv("JINA_API_KEY")
 
@@ -192,13 +200,14 @@ async def extract_evidence_from_url(
             "reason": "JINA_API_KEY is not configured.",
         }
 
-    # Fetch the actual webpage through Jina Reader.
+    # Step 3: Request structured JSON from Jina Reader.
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
                 "https://r.jina.ai/" + source_url,
                 headers={
                     "Authorization": f"Bearer {api_key}",
+                    "Accept": "application/json",
                 },
             )
     except httpx.HTTPError:
@@ -213,16 +222,64 @@ async def extract_evidence_from_url(
             "reason": f"Jina returned HTTP {response.status_code}.",
         }
 
-    if not response.text.strip():
+    # Step 4: Validate the returned JSON structure.
+    try:
+        payload = response.json()
+    except ValueError:
         return {
             "status": "FETCH_FAILED",
-            "reason": "Fetched webpage is empty.",
+            "reason": "Jina returned invalid JSON.",
         }
 
-    # Reuse our existing GPT-5 mini extraction and validation.
+    if not isinstance(payload, dict):
+        return {
+            "status": "FETCH_FAILED",
+            "reason": "Unexpected Jina response format.",
+        }
+
+    data = payload.get("data")
+
+    if not isinstance(data, dict):
+        return {
+            "status": "FETCH_FAILED",
+            "reason": "Jina response has no valid data object.",
+        }
+
+    returned_url = data.get("url")
+    page_text = data.get("content")
+
+    # Step 5: Validate the URL reported by Jina.
+    if not isinstance(returned_url, str):
+        return {
+            "status": "SOURCE_MISMATCH",
+            "reason": "Jina did not report a valid source URL.",
+        }
+
+    returned_safety = validate_allowed_source_url(returned_url)
+
+    if not returned_safety["safe"]:
+        return {
+            "status": "SOURCE_MISMATCH",
+            "reason": "Jina reported a non-allowlisted source URL.",
+        }
+
+    if returned_url.rstrip("/") != source_url.rstrip("/"):
+        return {
+            "status": "SOURCE_MISMATCH",
+            "reason": "Jina reported a different source URL.",
+        }
+
+    # Step 6: Check webpage content.
+    if not isinstance(page_text, str) or not page_text.strip():
+        return {
+            "status": "FETCH_FAILED",
+            "reason": "Fetched webpage content is empty.",
+        }
+
+    # Step 7: Reuse GPT-5 mini extraction and evidence validation.
     return await extract_evidence_from_text(
         claim=claim,
-        page_text=response.text,
+        page_text=page_text,
         fetched_url=source_url,
     )
 
