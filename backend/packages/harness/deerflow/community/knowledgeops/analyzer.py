@@ -374,7 +374,7 @@ async def analyze_claim_source(
 
 
 def aggregate_scored_evidence(results: list[dict]) -> dict:
-    """Aggregate scored evidence by publisher, not hostname."""
+    """Aggregate evidence by publisher and retain audit details."""
 
     publishers = {}
     duplicates_skipped = 0
@@ -396,7 +396,6 @@ def aggregate_scored_evidence(results: list[dict]) -> dict:
                 "reason": "Invalid scored evidence data.",
             }
 
-        # Identify the publisher using our unified source policy.
         publisher = get_source_publisher(source_url)
 
         if publisher is None:
@@ -410,20 +409,27 @@ def aggregate_scored_evidence(results: list[dict]) -> dict:
             "publisher": publisher,
             "stance": stance,
             "reliability_score": score,
+            "excerpt": evidence.get("excerpt"),
+            "evidence_date": evidence.get("evidence_date"),
+            "source_type": evidence.get("source_type"),
+            "is_primary_source": evidence.get("is_primary_source"),
+            "directness": evidence.get("directness"),
+            "reliability_details": details,
+            "date_verification_status": "NOT_VERIFIED",
         }
 
-        # Each publisher contributes at most one evidence score.
+        # Detect conflicts from the same publisher.
         if publisher in publishers:
             previous = publishers[publisher]
             previous_stance = previous["stance"]
 
-            # Different non-neutral stances from the same publisher
-            # require review rather than arbitrary selection.
             if stance != previous_stance and stance != "NEUTRAL" and previous_stance != "NEUTRAL":
                 return {
                     "status": "NEEDS_REVIEW",
-                    "reason": ("Conflicting evidence from the same publisher."),
+                    "reason": "Conflicting evidence from the same publisher.",
                     "publisher": publisher,
+                    "sources_used": list(publishers.values()) + [record],
+                    "duplicates_skipped": duplicates_skipped,
                 }
 
             duplicates_skipped += 1
@@ -439,12 +445,14 @@ def aggregate_scored_evidence(results: list[dict]) -> dict:
 
     relevant_evidence = [item for item in unique_evidence if item["stance"] != "NEUTRAL"]
 
-    # Require two distinct publishers with relevant evidence.
+    # Important: retain all evidence even when assessment fails.
     if len(relevant_evidence) < 2:
         return {
             "status": "INSUFFICIENT_EVIDENCE",
             "reason": ("At least two distinct publishers with relevant evidence are required."),
             "unique_publishers": len(publishers),
+            "relevant_evidence_count": len(relevant_evidence),
+            "sources_used": unique_evidence,
             "duplicates_skipped": duplicates_skipped,
         }
 
