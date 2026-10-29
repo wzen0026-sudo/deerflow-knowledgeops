@@ -7,7 +7,7 @@ from typing import Any
 def build_audit_report(
     investigation_result: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build an audit report preserving scored and review evidence."""
+    """Build an audit report with final and provisional evidence."""
 
     assessment = investigation_result.get("assessment") or {}
     sources = assessment.get("sources_used") or []
@@ -15,7 +15,6 @@ def build_audit_report(
 
     audited_sources = []
 
-    # Preserve successfully scored evidence.
     for source in sources:
         if not isinstance(source, dict):
             continue
@@ -54,7 +53,6 @@ def build_audit_report(
             }
         )
 
-    # Preserve extracted evidence that could not be scored.
     review_items = []
 
     for failure in failures:
@@ -66,6 +64,8 @@ def build_audit_report(
         if not isinstance(evidence, dict) or not evidence:
             continue
 
+        is_provisional = failure.get("status") == "PROVISIONAL_SCORED"
+
         review_items.append(
             {
                 "source_url": failure.get("source_url"),
@@ -73,6 +73,8 @@ def build_audit_report(
                 "stage": failure.get("stage"),
                 "reason": failure.get("reason"),
                 "evidence": evidence,
+                "review_required": True,
+                "provisional_result": (failure.get("provisional_result") if is_provisional else None),
                 "date_verification_status": evidence.get(
                     "date_verification_status",
                     "NOT_VERIFIED",
@@ -93,7 +95,7 @@ def build_audit_report(
         )
 
     return {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "generated_at_utc": datetime.now(UTC).isoformat(),
         "claim": investigation_result.get("claim"),
         "investigation_status": investigation_result.get("status"),
@@ -101,7 +103,14 @@ def build_audit_report(
         "assessment_report": assessment.get("report"),
         "assessment_reason": assessment.get("reason"),
         "sources_requested": investigation_result.get("sources_requested"),
-        "sources_scored": investigation_result.get("sources_scored"),
+        "sources_scored": investigation_result.get(
+            "sources_scored",
+            0,
+        ),
+        "sources_provisional": investigation_result.get(
+            "sources_provisional",
+            0,
+        ),
         "duplicates_skipped": assessment.get(
             "duplicates_skipped",
             0,
@@ -111,7 +120,8 @@ def build_audit_report(
         "failures": failures,
         "limitations": [
             "Confidence scores are heuristic, not probabilities.",
-            "Evidence dates require independent verification.",
+            "Provisional scores are not final confidence scores.",
+            "Source-provided dates are not independently verified.",
             "Different publishers may share original evidence.",
             "Evidence stance and relevance require further review.",
         ],

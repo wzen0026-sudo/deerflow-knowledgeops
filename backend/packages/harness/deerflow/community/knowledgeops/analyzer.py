@@ -335,18 +335,22 @@ async def score_accepted_evidence(
     analysis_result: dict,
     knowledge_type: str = "general",
 ) -> dict:
-    """Score evidence only when its date has verified provenance."""
+    """Score evidence with explicit provisional/final distinctions."""
 
-    # Step 1: Only accepted evidence can be scored.
     if analysis_result.get("status") != "ACCEPTED":
         return {
             "status": "SKIPPED",
             "reason": "Evidence has not passed validation.",
         }
 
-    evidence = analysis_result["evidence"]
+    evidence = analysis_result.get("evidence")
 
-    # Step 2: Require an evidence date.
+    if not isinstance(evidence, dict):
+        return {
+            "status": "NEEDS_REVIEW",
+            "reason": "Invalid evidence record.",
+        }
+
     if not evidence.get("evidence_date"):
         return {
             "status": "NEEDS_REVIEW",
@@ -354,21 +358,34 @@ async def score_accepted_evidence(
             "evidence": evidence,
         }
 
-    # Step 3: Do not trust dates extracted by the LLM alone.
+    provenance = evidence.get("date_provenance") or {}
+    metadata = evidence.get("publication_metadata_check") or {}
+
     date_status = evidence.get(
         "date_verification_status",
         "NOT_VERIFIED",
     )
 
-    if date_status != "VERIFIED":
+    # A final score requires an independent verification result.
+    independently_verified = date_status == "VERIFIED" and provenance.get("independently_verified") is True
+
+    # A provisional score requires matching source metadata.
+    provisionally_attested = (
+        date_status != "VERIFIED"
+        and provenance.get("status") == "SOURCE_ATTESTED"
+        and provenance.get("provisional_freshness_allowed") is True
+        and provenance.get("independently_verified") is False
+        and metadata.get("status") == "METADATA_MATCH"
+        and metadata.get("metadata_date") == evidence.get("evidence_date")
+    )
+
+    if not independently_verified and not provisionally_attested:
         return {
             "status": "NEEDS_REVIEW",
-            "reason": ("Evidence date has not been independently verified. Freshness scoring is withheld."),
-            "date_verification_status": date_status,
+            "reason": ("Evidence date lacks sufficient provenance for provisional or final scoring."),
             "evidence": evidence,
         }
 
-    # Step 4: Calculate reliability only with a verified date.
     try:
         details = calculate_evidence_reliability_details(
             source_type=evidence["source_type"],
@@ -377,17 +394,32 @@ async def score_accepted_evidence(
             is_primary_source=evidence["is_primary_source"],
             directness=evidence["directness"],
         )
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, AttributeError):
         return {
             "status": "NEEDS_REVIEW",
             "reason": "Evidence scoring inputs are invalid.",
             "evidence": evidence,
         }
 
+    # Provisional scores must not be treated as final scores.
+    if provisionally_attested:
+        return {
+            "status": "PROVISIONAL_SCORED",
+            "reason": ("The publication date matches source-provided metadata but is not independently verified."),
+            "evidence": evidence,
+            "provisional_result": {
+                **details,
+                "score_type": "PROVISIONAL",
+                "review_required": True,
+                "date_basis": "SOURCE_ATTESTED",
+            },
+        }
+
     return {
         "status": "SCORED",
         "source_url": evidence["source_url"],
         "stance": evidence["stance"],
+        "evidence": evidence,
         "reliability_score": details["reliability_score"],
         "reliability_result": details,
     }
@@ -398,38 +430,62 @@ async def analyze_claim_source(
     source_url: str,
     knowledge_type: str = "general",
 ) -> dict:
-    """Extract, verify, and score evidence from one source."""
+    """Extract, validate, and score evidence from one source."""
 
-    # Step 1: Fetch webpage and extract evidence using the LLM.
+    # Step 1: Fetch the webpage and extract evidence.
     extraction_result = await extract_evidence_from_url(
         claim=claim,
         source_url=source_url,
     )
 
-    # Step 2: Stop if evidence extraction or validation failed.
+    # Step 2: Stop if evidence extraction failed.
     if extraction_result.get("status") != "ACCEPTED":
         return {
             "status": extraction_result.get("status", "ERROR"),
             "stage": "extraction",
-            "reason": extraction_result.get("reason", "Evidence extraction failed."),
+            "source_url": source_url,
+            "reason": extraction_result.get(
+                "reason",
+                "Evidence extraction failed.",
+            ),
+            "evidence": extraction_result.get("evidence"),
         }
 
-    # Step 3: Score only accepted evidence.
+    # Step 3: Score accepted evidence.
     scoring_result = await score_accepted_evidence(
         extraction_result,
         knowledge_type=knowledge_type,
     )
 
-    # Step 4: Handle missing dates or scoring failures.
-    if scoring_result.get("status") != "SCORED":
+    scoring_status = scoring_result.get("status")
+
+    # Step 4: Preserve provisional scores separately.
+    if scoring_status == "PROVISIONAL_SCORED":
         return {
-            "status": scoring_result.get("status", "ERROR"),
+            "status": "PROVISIONAL_SCORED",
             "stage": "scoring",
-            "reason": scoring_result.get("reason", "Evidence scoring failed."),
+            "claim": claim,
+            "source_url": source_url,
+            "reason": scoring_result.get("reason"),
+            "evidence": extraction_result["evidence"],
+            "provisional_result": scoring_result["provisional_result"],
+        }
+
+    # Step 5: Preserve evidence requiring review.
+    if scoring_status != "SCORED":
+        return {
+            "status": scoring_status or "ERROR",
+            "stage": "scoring",
+            "claim": claim,
+            "source_url": source_url,
+            "reason": scoring_result.get(
+                "reason",
+                "Evidence scoring failed.",
+            ),
             "evidence": extraction_result["evidence"],
         }
 
-    # Step 5: Return the combined result.
+    # Step 6: Return the final scored evidence.
     return {
         "status": "SCORED",
         "claim": claim,
@@ -603,7 +659,7 @@ async def analyze_claim_sources(
     source_urls: list[str],
     knowledge_type: str = "general",
 ) -> dict:
-    """Analyze sources while preserving evidence requiring review."""
+    """Analyze sources and preserve provisional scores for review."""
 
     if not claim.strip():
         return {
@@ -625,6 +681,7 @@ async def analyze_claim_sources(
 
     scored_results = []
     failures = []
+    provisional_count = 0
 
     for url in source_urls:
         result = await analyze_claim_source(
@@ -633,23 +690,32 @@ async def analyze_claim_sources(
             knowledge_type=knowledge_type,
         )
 
-        if result.get("status") == "SCORED":
-            scored_results.append(result)
-        else:
-            # Preserve evidence even when scoring is withheld.
-            failures.append(
-                {
-                    "source_url": url,
-                    "status": result.get("status", "ERROR"),
-                    "stage": result.get("stage"),
-                    "reason": result.get(
-                        "reason",
-                        "Analysis failed.",
-                    ),
-                    "evidence": result.get("evidence"),
-                }
-            )
+        status = result.get("status", "ERROR")
 
+        # Only independently verified evidence enters final scoring.
+        if status == "SCORED":
+            scored_results.append(result)
+            continue
+
+        # Keep provisional scores in the review pipeline.
+        record = {
+            "source_url": url,
+            "status": status,
+            "stage": result.get("stage"),
+            "reason": result.get(
+                "reason",
+                "Analysis requires review.",
+            ),
+            "evidence": result.get("evidence"),
+        }
+
+        if status == "PROVISIONAL_SCORED":
+            provisional_count += 1
+            record["provisional_result"] = result.get("provisional_result")
+
+        failures.append(record)
+
+    # Provisional results must not enter final confidence assessment.
     assessment = await assess_scored_evidence(
         claim,
         scored_results,
@@ -660,6 +726,7 @@ async def analyze_claim_sources(
         "claim": claim,
         "sources_requested": len(source_urls),
         "sources_scored": len(scored_results),
+        "sources_provisional": provisional_count,
         "failures": failures,
         "assessment": assessment,
     }
