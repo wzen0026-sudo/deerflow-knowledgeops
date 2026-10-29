@@ -576,7 +576,7 @@ async def discover_source_urls(
     claim: str,
     max_sources: int = 3,
 ) -> dict:
-    """Find candidate evidence URLs using DeerFlow's Tavily search."""
+    """Find evidence URLs from multiple permitted publishers."""
 
     claim = claim.strip()
 
@@ -592,65 +592,110 @@ async def discover_source_urls(
             "reason": "max_sources must be between 1 and 5.",
         }
 
-    # Step 1: Search with DeerFlow's existing Tavily tool.
-    try:
-        raw_result = await asyncio.to_thread(
-            web_search_tool.invoke,
-            {"query": claim},
-        )
-        search_results = json.loads(raw_result)
-    except Exception:
-        return {
-            "status": "SEARCH_FAILED",
-            "reason": "Unable to retrieve or parse search results.",
-        }
+    # The first query is general.
+    # Additional queries target other permitted publishers.
+    # These supplemental domains are for the Python prototype.
+    search_queries = [
+        claim,
+        f"site:realpython.com {claim}",
+        f"site:endoflife.date {claim}",
+    ]
 
-    if not isinstance(search_results, list):
-        return {
-            "status": "SEARCH_FAILED",
-            "reason": "Unexpected search result format.",
-        }
-
-    # Step 2: Validate and select candidate source URLs.
     selected_sources = []
     seen_urls = set()
+    seen_publishers = set()
 
-    for item in search_results:
-        if not isinstance(item, dict):
-            continue
+    total_search_results = 0
+    searches_performed = 0
 
-        url = item.get("url")
+    # Two publishers are required by the current assessment pipeline.
+    target_publishers = min(2, max_sources)
 
-        if not isinstance(url, str):
-            continue
-
-        # Check URL safety and the unified source allowlist.
-        safety_result = validate_allowed_source_url(url)
-
-        if not safety_result["safe"]:
-            continue
-
-        # Skip duplicate URLs.
-        if url in seen_urls:
-            continue
-
-        seen_urls.add(url)
-
-        selected_sources.append(
-            {
-                "title": item.get("title", ""),
-                "url": url,
-            }
-        )
+    for query_index, query in enumerate(search_queries):
+        # Stop once enough distinct publishers have been found.
+        if len(seen_publishers) >= target_publishers:
+            break
 
         if len(selected_sources) >= max_sources:
             break
 
-    # Step 3: Return candidate sources.
+        searches_performed += 1
+
+        try:
+            raw_result = await asyncio.to_thread(
+                web_search_tool.invoke,
+                {"query": query},
+            )
+            search_results = json.loads(raw_result)
+
+            if not isinstance(search_results, list):
+                raise ValueError("Invalid search results.")
+
+        except Exception:
+            # The first search must succeed.
+            if query_index == 0:
+                return {
+                    "status": "SEARCH_FAILED",
+                    "reason": "Initial web search failed.",
+                }
+
+            # A failed supplemental search does not discard
+            # previously discovered sources.
+            continue
+
+        total_search_results += len(search_results)
+
+        for item in search_results:
+            if not isinstance(item, dict):
+                continue
+
+            url = item.get("url")
+
+            if not isinstance(url, str):
+                continue
+
+            # Verify URL safety and the unified allowlist.
+            safety_result = validate_allowed_source_url(url)
+
+            if not safety_result["safe"]:
+                continue
+
+            # Identify the source publisher.
+            publisher = get_source_publisher(url)
+
+            if publisher is None:
+                continue
+
+            # One candidate per publisher at this stage.
+            if publisher in seen_publishers:
+                continue
+
+            if url in seen_urls:
+                continue
+
+            seen_urls.add(url)
+            seen_publishers.add(publisher)
+
+            selected_sources.append(
+                {
+                    "title": item.get("title", ""),
+                    "url": url,
+                    "publisher": publisher,
+                }
+            )
+
+            if len(selected_sources) >= max_sources:
+                break
+
+            if len(seen_publishers) >= target_publishers:
+                break
+
     return {
         "status": "FOUND" if selected_sources else "NO_SOURCES",
         "claim": claim,
-        "total_search_results": len(search_results),
+        "total_search_results": total_search_results,
+        "searches_performed": searches_performed,
+        "unique_publishers": len(seen_publishers),
         "selected_sources": selected_sources,
     }
 
