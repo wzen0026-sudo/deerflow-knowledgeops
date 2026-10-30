@@ -1,6 +1,8 @@
 """Unified state-driven KnowledgeOps release orchestration."""
 
+import fcntl
 import json
+import os
 from pathlib import Path
 from uuid import UUID
 
@@ -18,7 +20,7 @@ from deerflow.community.knowledgeops.release_workflow import (
 )
 
 
-async def advance_release_pipeline(
+async def _advance_release_pipeline_unlocked(
     *,
     proposal_id: str,
     journal_dir: str | Path,
@@ -132,3 +134,85 @@ async def advance_release_pipeline(
         "journal_status": status,
         "reason": "Manual investigation is required before proceeding.",
     }
+
+
+async def advance_release_pipeline(
+    *,
+    proposal_id: str,
+    journal_dir: str | Path,
+    knowledge_dir: str | Path,
+    proposal_dir: str | Path,
+    old_track_id: str | None = None,
+    allow_retirement: bool = False,
+) -> dict:
+    """Advance one release stage with a per-knowledge process lock.
+
+    The lock covers this orchestrator entry point on a local
+    Linux filesystem. It is not a distributed lock.
+    """
+
+    # Validate the proposal ID before constructing a file path.
+    try:
+        if not isinstance(proposal_id, str) or str(UUID(proposal_id)) != proposal_id:
+            raise ValueError("Invalid proposal ID.")
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("Invalid proposal ID.") from exc
+
+    folder = Path(journal_dir)
+    journal_path = folder / f"{proposal_id}.json"
+
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+
+    if not isinstance(journal, dict) or journal.get("proposal_id") != proposal_id:
+        raise ValueError("Invalid release journal.")
+
+    knowledge_id = journal.get("knowledge_id")
+
+    try:
+        if not isinstance(knowledge_id, str) or str(UUID(knowledge_id)) != knowledge_id:
+            raise ValueError("Invalid knowledge ID.")
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("Invalid knowledge ID.") from exc
+
+    # Different proposals for the same knowledge share one lock.
+    lock_path = folder / f".{knowledge_id}.release.lock"
+
+    fd = os.open(
+        lock_path,
+        os.O_CREAT | os.O_RDWR,
+        0o600,
+    )
+
+    locked = False
+
+    try:
+        try:
+            # Do not wait indefinitely if another release is running.
+            fcntl.flock(
+                fd,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+            locked = True
+
+        except BlockingIOError:
+            return {
+                "status": "RELEASE_BUSY",
+                "knowledge_id": knowledge_id,
+                "reason": ("Another release operation is already running for this knowledge."),
+            }
+
+        # Execute the existing orchestration under the lock.
+        return await _advance_release_pipeline_unlocked(
+            proposal_id=proposal_id,
+            journal_dir=journal_dir,
+            knowledge_dir=knowledge_dir,
+            proposal_dir=proposal_dir,
+            old_track_id=old_track_id,
+            allow_retirement=allow_retirement,
+        )
+
+    finally:
+        if locked:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+        os.close(fd)

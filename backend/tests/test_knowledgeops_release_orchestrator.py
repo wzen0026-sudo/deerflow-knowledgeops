@@ -190,3 +190,51 @@ def test_uncertain_states_are_blocked(demo, status):
     demo["retire"].assert_not_awaited()
     demo["finalize"].assert_not_awaited()
     demo["verify"].assert_not_awaited()
+
+
+def test_concurrent_release_is_blocked(demo):
+    """Only one release may advance for the same knowledge."""
+
+    entered = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def slow_index_check(**kwargs):
+        entered.set()
+        await release_first.wait()
+        return {"status": "INDEXING"}
+
+    demo["index"].side_effect = slow_index_check
+
+    async def scenario():
+        args = {
+            "proposal_id": demo["proposal_id"],
+            "journal_dir": demo["folder"],
+            "knowledge_dir": demo["folder"] / "knowledge",
+            "proposal_dir": demo["folder"] / "proposals",
+        }
+
+        # First release acquires the lock and pauses.
+        first = asyncio.create_task(release_orchestrator.advance_release_pipeline(**args))
+
+        await asyncio.wait_for(entered.wait(), timeout=5)
+
+        try:
+            # Second release must not execute concurrently.
+            second = await release_orchestrator.advance_release_pipeline(**args)
+
+            assert second["status"] == "RELEASE_BUSY"
+            assert demo["index"].await_count == 1
+
+        finally:
+            release_first.set()
+
+        first_result = await first
+        assert first_result["status"] == "INDEXING"
+
+        # The lock should now be available again.
+        third = await release_orchestrator.advance_release_pipeline(**args)
+
+        assert third["status"] == "INDEXING"
+        assert demo["index"].await_count == 2
+
+    asyncio.run(scenario())
