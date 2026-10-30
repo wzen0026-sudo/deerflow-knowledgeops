@@ -12,6 +12,9 @@ from deerflow.community.knowledgeops.release_coordinator import (
 from deerflow.community.knowledgeops.release_finalization import (
     finalize_release_after_retirement,
 )
+from deerflow.community.knowledgeops.release_recovery import (
+    inspect_uncertain_deletion,
+)
 from deerflow.community.knowledgeops.release_retirement import (
     request_old_version_retirement,
 )
@@ -28,6 +31,7 @@ async def _advance_release_pipeline_unlocked(
     proposal_dir: str | Path,
     old_track_id: str | None = None,
     allow_retirement: bool = False,
+    inspect_deletion: bool = False,
 ) -> dict:
     """Advance one stage of an existing release.
 
@@ -40,7 +44,7 @@ async def _advance_release_pipeline_unlocked(
             raise ValueError("Invalid proposal ID.")
         if str(UUID(proposal_id)) != proposal_id:
             raise ValueError("Invalid proposal ID.")
-    except (ValueError, AttributeError) as exc:
+    except (ValueError, TypeError, AttributeError) as exc:
         raise ValueError("Invalid proposal ID.") from exc
 
     journal_path = Path(journal_dir) / f"{proposal_id}.json"
@@ -128,11 +132,33 @@ async def _advance_release_pipeline_unlocked(
             new_track_id=recorded_new_track,
         )
 
+    # Stage 5: Read-only inspection of an uncertain deletion.
+    if (
+        status
+        in {
+            "DELETION_REQUESTING",
+            "DELETION_UNKNOWN",
+            "DELETION_NEEDS_REVIEW",
+        }
+        and inspect_deletion is True
+    ):
+        inspection = await inspect_uncertain_deletion(
+            proposal_id=proposal_id,
+            journal_dir=journal_dir,
+        )
+
+        return {
+            "status": "NEEDS_RECONCILIATION",
+            "journal_status": status,
+            "inspection": inspection,
+            "reason": ("Read-only inspection completed. No deletion, retry, or publication was performed."),
+        }
+
     # Unexpected or uncertain states must never trigger blind retries.
     return {
         "status": "NEEDS_RECONCILIATION",
         "journal_status": status,
-        "reason": "Manual investigation is required before proceeding.",
+        "reason": ("Manual investigation is required before proceeding."),
     }
 
 
@@ -144,6 +170,7 @@ async def advance_release_pipeline(
     proposal_dir: str | Path,
     old_track_id: str | None = None,
     allow_retirement: bool = False,
+    inspect_deletion: bool = False,
 ) -> dict:
     """Advance one release stage with a per-knowledge process lock.
 
@@ -209,10 +236,14 @@ async def advance_release_pipeline(
             proposal_dir=proposal_dir,
             old_track_id=old_track_id,
             allow_retirement=allow_retirement,
+            inspect_deletion=inspect_deletion,
         )
 
     finally:
         if locked:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            fcntl.flock(
+                fd,
+                fcntl.LOCK_UN,
+            )
 
         os.close(fd)

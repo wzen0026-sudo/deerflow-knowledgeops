@@ -2,9 +2,11 @@
 
 import asyncio
 import json
+from functools import partial
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import httpx
 import pytest
 
 from deerflow.community.knowledgeops import release_recovery
@@ -170,3 +172,124 @@ def test_unexpected_state_requires_review(demo):
 
     assert result["status"] == "NEEDS_MANUAL_REVIEW"
     demo["verify"].assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("old_present", "new_valid", "expected"),
+    [
+        (False, True, "REMOTE_CUTOVER_OBSERVED"),
+        (True, True, "OLD_DOCUMENT_STILL_PRESENT"),
+        (False, False, "NEEDS_MANUAL_REVIEW"),
+        (True, False, "NEEDS_MANUAL_REVIEW"),
+    ],
+)
+def test_uncertain_deletion_inspection(demo, monkeypatch, old_present, new_valid, expected):
+    journal = saved_journal(demo)
+    journal.update(
+        {
+            "status": "DELETION_UNKNOWN",
+            "old_document_id": "doc-old",
+            "new_document_id": "doc-new",
+        }
+    )
+
+    demo["journal_path"].write_text(json.dumps(journal), encoding="utf-8")
+
+    knowledge_id = demo["knowledge_id"]
+
+    old_documents = (
+        [
+            {
+                "id": "doc-old",
+                "status": "processed",
+                "file_path": f"knowledgeops-{knowledge_id}-v1.txt",
+            }
+        ]
+        if old_present
+        else []
+    )
+
+    new_documents = [
+        {
+            "id": "doc-new",
+            "status": "processed" if new_valid else "failed",
+            "file_path": f"knowledgeops-{knowledge_id}-v2.txt",
+        }
+    ]
+
+    def handler(request):
+        assert request.method == "GET"
+
+        track_id = request.url.path.rsplit("/", 1)[-1]
+
+        if track_id == "insert_old_test":
+            documents = old_documents
+        elif track_id == "insert_new_test":
+            documents = new_documents
+        else:
+            raise AssertionError("Unexpected tracking ID")
+
+        return httpx.Response(
+            200,
+            json={"track_id": track_id, "documents": documents},
+        )
+
+    monkeypatch.setenv("LIGHTRAG_API_KEY", "test-key")
+    monkeypatch.setenv("LIGHTRAG_BASE_URL", "http://127.0.0.1:9621")
+
+    real_client = httpx.AsyncClient
+
+    monkeypatch.setattr(
+        release_recovery.httpx,
+        "AsyncClient",
+        partial(real_client, transport=httpx.MockTransport(handler)),
+    )
+
+    result = asyncio.run(
+        release_recovery.inspect_uncertain_deletion(
+            proposal_id=demo["proposal_id"],
+            journal_dir=demo["journal_dir"],
+        )
+    )
+
+    assert result["status"] == expected
+
+    # Inspection must never modify the release journal.
+    assert saved_journal(demo) == journal
+
+
+def test_uncertain_deletion_network_failure(demo, monkeypatch):
+    journal = saved_journal(demo)
+    journal.update(
+        {
+            "status": "DELETION_UNKNOWN",
+            "old_document_id": "doc-old",
+            "new_document_id": "doc-new",
+        }
+    )
+
+    demo["journal_path"].write_text(json.dumps(journal), encoding="utf-8")
+
+    monkeypatch.setenv("LIGHTRAG_API_KEY", "test-key")
+    monkeypatch.setenv("LIGHTRAG_BASE_URL", "http://127.0.0.1:9621")
+
+    real_client = httpx.AsyncClient
+
+    monkeypatch.setattr(
+        release_recovery.httpx,
+        "AsyncClient",
+        partial(
+            real_client,
+            transport=httpx.MockTransport(lambda request: httpx.Response(503)),
+        ),
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(
+            release_recovery.inspect_uncertain_deletion(
+                proposal_id=demo["proposal_id"],
+                journal_dir=demo["journal_dir"],
+            )
+        )
+
+    assert saved_journal(demo) == journal

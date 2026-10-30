@@ -3,9 +3,13 @@
 import fcntl
 import json
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
+
+import httpx
+from dotenv import find_dotenv, load_dotenv
 
 from deerflow.community.knowledgeops.knowledge_versions import (
     load_knowledge_history,
@@ -192,4 +196,134 @@ async def recover_completed_local_release(
         "proposal_id": proposal_id,
         "current_version": new_version,
         "journal_status": "PUBLISHED",
+    }
+
+
+async def inspect_uncertain_deletion(
+    *,
+    proposal_id: str,
+    journal_dir: str | Path,
+) -> dict:
+    """Inspect an uncertain LightRAG deletion without modifying anything."""
+
+    try:
+        if str(UUID(proposal_id)) != proposal_id:
+            raise ValueError("Noncanonical proposal ID")
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("Invalid proposal ID") from exc
+
+    journal_path = Path(journal_dir) / f"{proposal_id}.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+
+    if (
+        not isinstance(journal, dict)
+        or journal.get("proposal_id") != proposal_id
+        or journal.get("status")
+        not in {
+            "DELETION_REQUESTING",
+            "DELETION_UNKNOWN",
+            "DELETION_NEEDS_REVIEW",
+        }
+    ):
+        raise ValueError("Journal is not in an uncertain deletion state")
+
+    knowledge_id = journal.get("knowledge_id")
+    try:
+        if str(UUID(knowledge_id)) != knowledge_id:
+            raise ValueError("Noncanonical knowledge ID")
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("Invalid knowledge ID") from exc
+
+    old_version = journal.get("old_version")
+    new_version = journal.get("new_version")
+    receipt = journal.get("receipt")
+
+    if (
+        type(old_version) is not int
+        or type(new_version) is not int
+        or new_version != old_version + 1
+        or not isinstance(receipt, dict)
+        or receipt.get("status") != "SUBMITTED"
+        or receipt.get("knowledge_id") != knowledge_id
+        or receipt.get("version") != new_version
+    ):
+        raise ValueError("Inconsistent release metadata")
+
+    old_track = journal.get("old_track_id")
+    new_track = receipt.get("track_id")
+    old_doc = journal.get("old_document_id")
+    new_doc = journal.get("new_document_id")
+
+    for track in (old_track, new_track):
+        if not isinstance(track, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", track):
+            raise ValueError("Invalid tracking ID")
+
+    if old_track == new_track:
+        raise ValueError("Old and new tracking IDs are identical")
+
+    for doc_id in (old_doc, new_doc):
+        if not isinstance(doc_id, str) or not doc_id.startswith("doc-"):
+            raise ValueError("Invalid document ID")
+
+    if old_doc == new_doc:
+        raise ValueError("Old and new document IDs are identical")
+
+    load_dotenv(find_dotenv(usecwd=True))
+
+    api_key = os.getenv("LIGHTRAG_API_KEY")
+    base_url = os.getenv("LIGHTRAG_BASE_URL", "http://127.0.0.1:9621").rstrip("/")
+
+    if not api_key:
+        raise RuntimeError("LIGHTRAG_API_KEY is missing")
+
+    async with httpx.AsyncClient(timeout=20) as client:
+
+        async def fetch(track_id: str) -> list:
+            response = await client.get(
+                f"{base_url}/documents/track_status/{track_id}",
+                headers={"X-API-Key": api_key},
+            )
+            response.raise_for_status()
+
+            payload = response.json()
+
+            if not isinstance(payload, dict) or payload.get("track_id") != track_id or not isinstance(payload.get("documents"), list):
+                raise RuntimeError("Invalid LightRAG tracking response")
+
+            return payload["documents"]
+
+        old_documents = await fetch(old_track)
+        new_documents = await fetch(new_track)
+
+    def matches(document: dict, doc_id: str, version: int) -> bool:
+        expected_source = f"knowledgeops-{knowledge_id}-v{version}.txt"
+
+        return isinstance(document, dict) and document.get("id") == doc_id and document.get("file_path") == expected_source
+
+    # Never continue if the replacement document is unavailable.
+    if len(new_documents) != 1 or not matches(new_documents[0], new_doc, new_version) or new_documents[0].get("status", "").lower() != "processed":
+        return {
+            "status": "NEEDS_MANUAL_REVIEW",
+            "reason": "Replacement document is not verified",
+        }
+
+    if old_documents:
+        if len(old_documents) != 1 or not matches(old_documents[0], old_doc, old_version):
+            return {
+                "status": "NEEDS_MANUAL_REVIEW",
+                "reason": "Old document identity is inconsistent",
+            }
+
+        return {
+            "status": "OLD_DOCUMENT_STILL_PRESENT",
+            "reason": "Do not repeat the deletion request automatically",
+        }
+
+    # This only proves that the old document is absent from the
+    # tracking response, not necessarily every retrieval index.
+    return {
+        "status": "REMOTE_CUTOVER_OBSERVED",
+        "old_document_status": "NOT_FOUND",
+        "new_document_status": "INDEXED",
+        "requires_confirmation": True,
     }

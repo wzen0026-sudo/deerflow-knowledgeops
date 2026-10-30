@@ -238,3 +238,37 @@ def test_concurrent_release_is_blocked(demo):
         assert demo["index"].await_count == 2
 
     asyncio.run(scenario())
+
+
+def test_uncertain_deletion_read_only_inspection(demo, monkeypatch):
+    set_status(demo, "DELETION_UNKNOWN")
+
+    inspect = AsyncMock(
+        return_value={
+            "status": "REMOTE_CUTOVER_OBSERVED",
+            "requires_confirmation": True,
+        }
+    )
+
+    monkeypatch.setattr(
+        release_orchestrator,
+        "inspect_uncertain_deletion",
+        inspect,
+    )
+
+    result = asyncio.run(
+        release_orchestrator.advance_release_pipeline(
+            proposal_id=demo["proposal_id"],
+            journal_dir=demo["folder"],
+            knowledge_dir=demo["folder"] / "knowledge",
+            proposal_dir=demo["folder"] / "proposals",
+            inspect_deletion=True,
+        )
+    )
+
+    assert result["status"] == "NEEDS_RECONCILIATION"
+    assert result["inspection"]["status"] == "REMOTE_CUTOVER_OBSERVED"
+
+    inspect.assert_awaited_once()
+    demo["retire"].assert_not_awaited()
+    demo["finalize"].assert_not_awaited()
