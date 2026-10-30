@@ -43,17 +43,19 @@ jobs:
         working-directory: backend
         run: uv sync --group dev
 
+
       - name: Ruff lint
         working-directory: backend
         run: |
-          uv run ruff check packages/harness/deerflow/community/knowledgeops tests/test_knowledgeops_lifecycle.py
+          uv run ruff check packages/harness/deerflow/community/knowledgeops tests/test_knowledgeops_*.py
 
       - name: Ruff format
         working-directory: backend
         run: |
-          uv run ruff format --check packages/harness/deerflow/community/knowledgeops tests/test_knowledgeops_lifecycle.py
+          uv run ruff format --check packages/harness/deerflow/community/knowledgeops tests/test_knowledgeops_*.py
 
       - name: Run KnowledgeOps tests
         working-directory: backend
         run: |
-          uv run pytest -q tests/test_knowledgeops_lifecycle.py
+          uv run pytest -q tests/test_knowledgeops_*.py
+      
